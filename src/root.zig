@@ -21,9 +21,17 @@ pub const QuickAllocOptions = struct {
     buckets: []const BucketDef,
     /// If a requested allocation exceeds the maximum block size, how should this allocator respond
     ///
-    /// the `.UNREACHABLE` option will slightly reduce the overhead of checking whether a requested allocation does or does not fall
-    /// into the 'large' category and prevent branching
+    /// the `.UNREACHABLE` option will slightly reduce the processing overhead of checking whether a
+    /// requested allocation does or does not fall into the 'large' category and prevent branching
     large_allocation_behavior: LargeAllocBehavior = LargeAllocBehavior.USE_PAGE_ALLOCATOR,
+    /// Enable additional tracking for allocation usage.
+    ///
+    /// This option allows logging functions to report additional statistics,
+    /// (or for the user to inspect the stats themselves). This adds a moderate amount of processing overhead to all
+    /// allocation functions and increases the memory footprint of the allocator by around 3x.
+    ///
+    /// It provides no additional behavioral functionality or performance.
+    track_allocation_statistics: bool = false,
     /// How likely it is for this allocator to get an allocation request greater than the largest block size
     hint_large_allocation: Hint = Hint.UNKNOWN,
     /// How likely is it that a free block will exist for any given bucket
@@ -127,31 +135,6 @@ pub const AllocSize = enum(math.Log2Int(usize)) {
     _128_GB = 37,
     _256_GB = 38,
     _512_GB = 39,
-    _1_Terabyte = 40,
-    _2_Terabytes = 41,
-    _4_Terabytes = 42,
-    _8_Terabytes = 43,
-    _16_Terabytes = 44,
-    _32_Terabytes = 45,
-    _64_Terabytes = 46,
-    _128_Terabytes = 47,
-    _256_Terabytes = 48,
-    _512_Terabytes = 49,
-    _1_Petabyte = 50,
-    _2_Petabytes = 51,
-    _4_Petabytes = 52,
-    _8_Petabytes = 53,
-    _16_Petabytes = 54,
-    _32_Petabytes = 55,
-    _64_Petabytes = 56,
-    _128_Petabytes = 57,
-    _256_Petabytes = 58,
-    _512_Petabytes = 59,
-    _1_Exabyte = 60,
-    _2_Exabytes = 61,
-    _4_Exabytes = 62,
-    _8_Exabytes = 63,
-    _16_Exabytes = 64,
 
     pub inline fn bytes_log2(self: AllocSize) usize {
         return @intFromEnum(self);
@@ -163,6 +146,79 @@ pub const AllocSize = enum(math.Log2Int(usize)) {
 
     pub inline fn to_alignment(self: AllocSize) mem.Alignment {
         return @enumFromInt(@intFromEnum(self));
+    }
+
+    pub inline fn get_name(self: AllocSize) []const u8 {
+        return get_name_from_bytes_log2(@intFromEnum(self));
+    }
+
+    pub fn get_name_from_bytes_log2(val: math.Log2Int(usize)) []const u8 {
+        return switch (val) {
+            0 => "1 byte",
+            1 => "2 bytes",
+            2 => "4 bytes",
+            3 => "8 bytes",
+            4 => "16 bytes",
+            5 => "32 bytes",
+            6 => "64 bytes",
+            7 => "128 bytes",
+            8 => "256 bytes",
+            9 => "512 bytes",
+            10 => "1 kilobyte",
+            11 => "2 kilobytes",
+            12 => "4 kilobytes",
+            13 => "8 kilobytes",
+            14 => "16 kilobytes",
+            15 => "32 kilobytes",
+            16 => "64 kilobytes",
+            17 => "128 kilobytes",
+            18 => "256 kilobytes",
+            19 => "512 kilobytes",
+            20 => "1 megabyte",
+            21 => "2 megabytes",
+            22 => "4 megabytes",
+            23 => "8 megabytes",
+            24 => "16 megabytes",
+            25 => "32 megabytes",
+            26 => "64 megabytes",
+            27 => "128 megabytes",
+            28 => "256 megabytes",
+            29 => "512 megabytes",
+            30 => "1 gigabyte",
+            31 => "2 gigabytes",
+            32 => "4 gigabytes",
+            33 => "8 gigabytes",
+            34 => "16 gigabytes",
+            35 => "32 gigabytes",
+            36 => "64 gigabytes",
+            37 => "128 gigabytes",
+            38 => "256 gigabytes",
+            39 => "512 gigabytes",
+            40 => "1 terabyte",
+            41 => "2 terabytes",
+            42 => "4 terabytes",
+            43 => "8 terabytes",
+            44 => "16 terabytes",
+            45 => "32 terabytes",
+            46 => "64 terabytes",
+            47 => "128 terabytes",
+            48 => "256 terabytes",
+            49 => "512 terabytes",
+            50 => "1 petabyte",
+            51 => "2 petabytes",
+            52 => "4 petabytes",
+            53 => "8 petabytes",
+            54 => "16 petabytes",
+            55 => "32 petabytes",
+            56 => "64 petabytes",
+            57 => "128 petabytes",
+            58 => "256 petabytes",
+            59 => "512 petabytes",
+            60 => "1 exabyte",
+            61 => "2 exabytes",
+            62 => "4 exabytes",
+            63 => "8 exabytes",
+        };
     }
 };
 
@@ -274,6 +330,7 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
         recycled_block_count_by_bucket: [BUCKET_COUNT]usize = @splat(0),
         first_brand_new_block_by_bucket: [BUCKET_COUNT]usize = @splat(0),
         brand_new_block_count_by_bucket: [BUCKET_COUNT]usize = @splat(0),
+        stats: AllocStats = AllocStats{},
         // first_free_allocation: usize,
 
         const QuickAlloc = @This();
@@ -294,9 +351,32 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
         const RECYCLE_HINT = options.hint_buckets_have_free_blocks_that_were_used_in_the_past;
         const BRAND_NEW_HINT = options.hint_buckets_have_free_blocks_that_have_never_been_used;
         const STAT_LOG_HINT = options.hint_log_usage_statistics;
+        const TRACK_STATS = options.track_allocation_statistics;
         const MSG_LARGE_ALLOCATION = "Large allocation: largest bucket size is " ++ @tagName(@as(AllocSize, @enumFromInt(LARGEST_BLOCK_SIZE_LOG2))) ++ ", but the requested allocation would require a bucket size of {s}";
         const MSG_LARGE_RESIZE = "Large resize/remap: largest bucket size is " ++ @tagName(@as(AllocSize, @enumFromInt(LARGEST_BLOCK_SIZE_LOG2))) ++ ", but either the old memory allocation ({s}) or the new memory allocation ({s}) would exceed this limit";
         const MSG_LARGE_FREE = "Large free: largest bucket size is " ++ @tagName(@as(AllocSize, @enumFromInt(LARGEST_BLOCK_SIZE_LOG2))) ++ ", but the memory provided to free exceeds this limit: {s}";
+
+        pub const AllocStats = if (!TRACK_STATS) void else struct {
+            current_total_memory_allocated: usize = 0,
+            largest_total_memory_allocated: usize = 0,
+            smallest_allocation_request_ever: usize = math.maxInt(usize),
+            largest_allocation_request_ever: usize = 0,
+            largest_allocation_request_by_bucket: [BUCKET_COUNT]usize = @splat(0),
+            smallest_allocation_request_by_bucket: [BUCKET_COUNT]usize = @splat(math.maxInt(usize)),
+            most_blocks_ever_used_by_bucket: [BUCKET_COUNT]usize = @splat(0),
+            current_blocks_used_by_bucket: [BUCKET_COUNT]usize = @splat(0),
+            most_slabs_ever_used_by_bucket: [BUCKET_COUNT]usize = @splat(0),
+            current_slabs_used_by_bucket: [BUCKET_COUNT]usize = @splat(0),
+            number_of_attempted_resizes_to_larger_buckets_by_bucket: [BUCKET_COUNT]usize = @splat(0),
+            largest_page_allocator_fallback_request_ever: usize = 0,
+            smallest_page_allocator_fallback_request_ever: usize = math.maxInt(usize),
+            largest_total_bytes_allocated_from_page_allocator_fallback: usize = 0,
+            current_total_bytes_allocated_from_page_allocator_fallback: usize = 0,
+            largest_number_of_page_allocator_fallback_allocations: usize = 0,
+            current_number_of_page_allocator_fallback_allocations: usize = 0,
+            largest_attempted_page_allocator_fallback_resize_delta_grow: usize = 0,
+            largest_attempted_page_allocator_fallback_resize_delta_shrink: usize = 0,
+        };
 
         pub const VTABLE: Allocator.VTable = .{
             .alloc = alloc,
@@ -312,20 +392,44 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
         fn alloc(self_opaque: *anyopaque, len: usize, alignment: mem.Alignment, ret_addr: usize) ?[*]u8 {
             _ = ret_addr;
             const self: *QuickAlloc = @ptrCast(@alignCast(self_opaque));
-            const alloc_size_log2 = get_size_log2(len, alignment);
+            const alloc_size_log2 = get_bytes_log2(len, alignment);
+            if (TRACK_STATS) {
+                if (len < self.stats.smallest_allocation_request_ever) self.stats.smallest_allocation_request_ever = len;
+                if (len > self.stats.largest_allocation_request_ever) self.stats.largest_allocation_request_ever = len;
+            }
             switch (LARGE_ALLOC_BEHAVIOR) {
                 .USE_PAGE_ALLOC => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
                     @branchHint(LARGE_ALLOC_HINT);
+                    if (TRACK_STATS) {
+                        if (len > self.stats.largest_page_allocator_fallback_request_ever) self.stats.largest_page_allocator_fallback_request_ever = len;
+                        if (len < self.stats.smallest_page_allocator_fallback_request_ever) self.stats.smallest_page_allocator_fallback_request_ever = len;
+                        self.stats.current_number_of_page_allocator_fallback_allocations += 1;
+                        if (self.stats.current_number_of_page_allocator_fallback_allocations > self.stats.largest_number_of_page_allocator_fallback_allocations) self.stats.largest_number_of_page_allocator_fallback_allocations = self.stats.current_number_of_page_allocator_fallback_allocations;
+                        self.stats.current_total_bytes_allocated_from_page_allocator_fallback += len;
+                        if (self.stats.current_total_bytes_allocated_from_page_allocator_fallback > self.stats.largest_total_bytes_allocated_from_page_allocator_fallback) self.stats.largest_total_bytes_allocated_from_page_allocator_fallback = self.stats.current_total_bytes_allocated_from_page_allocator_fallback;
+                        self.stats.current_total_memory_allocated += len;
+                        if (self.stats.current_total_memory_allocated > self.stats.largest_total_memory_allocated) self.stats.largest_total_memory_allocated = self.stats.current_total_memory_allocated;
+                    }
                     return PageAllocator.map(len, alignment);
                 },
                 .USE_PAGE_ALLOC_AND_LOG => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
                     @branchHint(LARGE_ALLOC_HINT);
-                    std.log.info(MSG_LARGE_ALLOCATION, .{@tagName(@as(AllocSize, @enumFromInt(alloc_size_log2)))});
+                    std.log.info(MSG_LARGE_ALLOCATION, .{AllocSize.get_name_from_bytes_log2(alloc_size_log2)});
+                    if (TRACK_STATS) {
+                        if (len > self.stats.largest_page_allocator_fallback_request_ever) self.stats.largest_page_allocator_fallback_request_ever = len;
+                        if (len < self.stats.smallest_page_allocator_fallback_request_ever) self.stats.smallest_page_allocator_fallback_request_ever = len;
+                        self.stats.current_number_of_page_allocator_fallback_allocations += 1;
+                        if (self.stats.current_number_of_page_allocator_fallback_allocations > self.stats.largest_number_of_page_allocator_fallback_allocations) self.stats.largest_number_of_page_allocator_fallback_allocations = self.stats.current_number_of_page_allocator_fallback_allocations;
+                        self.stats.current_total_bytes_allocated_from_page_allocator_fallback += len;
+                        if (self.stats.current_total_bytes_allocated_from_page_allocator_fallback > self.stats.largest_total_bytes_allocated_from_page_allocator_fallback) self.stats.largest_total_bytes_allocated_from_page_allocator_fallback = self.stats.current_total_bytes_allocated_from_page_allocator_fallback;
+                        self.stats.current_total_memory_allocated += len;
+                        if (self.stats.current_total_memory_allocated > self.stats.largest_total_memory_allocated) self.stats.largest_total_memory_allocated = self.stats.current_total_memory_allocated;
+                    }
                     return PageAllocator.map(len, alignment);
                 },
                 .PANIC => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
                     @branchHint(.cold);
-                    std.debug.panic(MSG_LARGE_ALLOCATION, .{@tagName(@as(AllocSize, @enumFromInt(alloc_size_log2)))});
+                    std.debug.panic(MSG_LARGE_ALLOCATION, .{AllocSize.get_name_from_bytes_log2(alloc_size_log2)});
                 },
                 .UNREACHABLE => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) unreachable,
             }
@@ -336,6 +440,12 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
                 const next_free_address: *usize = @ptrFromInt(first_free_address);
                 self.first_recycled_block_by_bucket[bucket_idx] = next_free_address.*;
                 self.recycled_block_count_by_bucket[bucket_idx] -= 1;
+                if (TRACK_STATS) {
+                    if (len > self.stats.largest_allocation_request_by_bucket[bucket_idx]) self.stats.largest_allocation_request_by_bucket[bucket_idx] = len;
+                    if (len < self.stats.smallest_allocation_request_by_bucket[bucket_idx]) self.stats.smallest_allocation_request_by_bucket[bucket_idx] = len;
+                    self.stats.current_blocks_used_by_bucket[bucket_idx] += 1;
+                    if (self.stats.current_blocks_used_by_bucket[bucket_idx] > self.stats.most_blocks_ever_used_by_bucket[bucket_idx]) self.stats.most_blocks_ever_used_by_bucket[bucket_idx] = self.stats.current_blocks_used_by_bucket[bucket_idx];
+                }
                 return @ptrFromInt(first_free_address);
             }
             if (self.brand_new_block_count_by_bucket[bucket_idx] != 0) {
@@ -344,72 +454,151 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
                 const next_unused_addr = first_free_address + BLOCK_BYTES[bucket_idx];
                 self.first_brand_new_block_by_bucket[bucket_idx] = next_unused_addr;
                 self.brand_new_block_count_by_bucket[bucket_idx] -= 1;
+                if (TRACK_STATS) {
+                    if (len > self.stats.largest_allocation_request_by_bucket[bucket_idx]) self.stats.largest_allocation_request_by_bucket[bucket_idx] = len;
+                    if (len < self.stats.smallest_allocation_request_by_bucket[bucket_idx]) self.stats.smallest_allocation_request_by_bucket[bucket_idx] = len;
+                    self.stats.current_blocks_used_by_bucket[bucket_idx] += 1;
+                    if (self.stats.current_blocks_used_by_bucket[bucket_idx] > self.stats.most_blocks_ever_used_by_bucket[bucket_idx]) self.stats.most_blocks_ever_used_by_bucket[bucket_idx] = self.stats.current_blocks_used_by_bucket[bucket_idx];
+                }
                 return @ptrFromInt(first_free_address);
             }
             const block_size = BLOCK_BYTES[bucket_idx];
             const new_slab = PageAllocator.map(SLAB_BYTES[bucket_idx], bytes_log2_to_alignment(BLOCK_BYTES_LOG2[bucket_idx])) orelse return null;
             self.first_brand_new_block_by_bucket[bucket_idx] = @intFromPtr(new_slab) + block_size;
             self.brand_new_block_count_by_bucket[bucket_idx] = LEFTOVER_BLOCKS_PER_SLAB[bucket_idx];
+            if (TRACK_STATS) {
+                if (len > self.stats.largest_allocation_request_by_bucket[bucket_idx]) self.stats.largest_allocation_request_by_bucket[bucket_idx] = len;
+                if (len < self.stats.smallest_allocation_request_by_bucket[bucket_idx]) self.stats.smallest_allocation_request_by_bucket[bucket_idx] = len;
+                self.stats.current_blocks_used_by_bucket[bucket_idx] += 1;
+                if (self.stats.current_blocks_used_by_bucket[bucket_idx] > self.stats.most_blocks_ever_used_by_bucket[bucket_idx]) self.stats.most_blocks_ever_used_by_bucket[bucket_idx] = self.stats.current_blocks_used_by_bucket[bucket_idx];
+                self.stats.current_slabs_used_by_bucket[bucket_idx] += 1;
+                if (self.stats.current_slabs_used_by_bucket[bucket_idx] > self.stats.most_slabs_ever_used_by_bucket[bucket_idx]) self.stats.most_slabs_ever_used_by_bucket[bucket_idx] = self.stats.current_slabs_used_by_bucket[bucket_idx];
+                self.stats.current_total_memory_allocated += SLAB_BYTES[bucket_idx];
+                if (self.stats.current_total_memory_allocated > self.stats.largest_total_memory_allocated) self.stats.largest_total_memory_allocated = self.stats.current_total_memory_allocated;
+            }
             return new_slab;
         }
 
         fn resize(self_opaque: *anyopaque, memory: []u8, alignment: mem.Alignment, new_len: usize, ret_addr: usize) bool {
             _ = ret_addr;
-            _ = self_opaque;
-            const old_alloc_size_log2 = get_size_log2(memory.len, alignment);
-            const new_alloc_size_log2 = get_size_log2(new_len, alignment);
+            const self: *QuickAlloc = @ptrCast(@alignCast(self_opaque));
+            const old_alloc_size_log2 = get_bytes_log2(memory.len, alignment);
+            const new_alloc_size_log2 = get_bytes_log2(new_len, alignment);
             switch (LARGE_ALLOC_BEHAVIOR) {
                 .USE_PAGE_ALLOC, .USE_PAGE_ALLOC_AND_LOG => if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 or new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
                     @branchHint(LARGE_ALLOC_HINT);
+                    if (TRACK_STATS) {
+                        if (old_alloc_size_log2 <= LARGEST_BLOCK_SIZE_LOG2 and new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
+                            const old_bucket = ALLOC_SIZE_LOG2_TO_BUCKET_IDX[old_alloc_size_log2];
+                            self.stats.number_of_attempted_resizes_to_larger_buckets_by_bucket[old_bucket] += 1;
+                        } else if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 and new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
+                            if (new_len > memory.len) {
+                                const delta = new_len - memory.len;
+                                if (delta > self.stats.largest_attempted_page_allocator_fallback_resize_delta_grow) self.stats.largest_attempted_page_allocator_fallback_resize_delta_grow = delta;
+                            }
+                            if (new_len < memory.len) {
+                                const delta = memory.len - new_len;
+                                if (delta > self.stats.largest_attempted_page_allocator_fallback_resize_delta_shrink) self.stats.largest_attempted_page_allocator_fallback_resize_delta_shrink = delta;
+                            }
+                            if (new_len < self.stats.smallest_page_allocator_fallback_request_ever) self.stats.smallest_page_allocator_fallback_request_ever = new_len;
+                            if (new_len > self.stats.largest_page_allocator_fallback_request_ever) self.stats.largest_page_allocator_fallback_request_ever = new_len;
+                            const resize_result = PageAllocator.realloc(memory, new_len, false);
+                            if (resize_result != null) {
+                                if (new_len > memory.len) self.stats.current_total_memory_allocated += (new_len - memory.len);
+                                if (new_len < memory.len) self.stats.current_total_memory_allocated -= (memory.len - new_len);
+                            }
+                            return resize_result != null;
+                        }
+                        return false;
+                    }
                     if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 and new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) return PageAllocator.realloc(memory, new_len, false) != null;
                     return false;
                 },
                 .PANIC => if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 or new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
                     @branchHint(.cold);
-                    std.debug.panic(MSG_LARGE_RESIZE, .{ @tagName(@as(AllocSize, @enumFromInt(old_alloc_size_log2))), @tagName(@as(AllocSize, @enumFromInt(new_alloc_size_log2))) });
+                    std.debug.panic(MSG_LARGE_RESIZE, .{ AllocSize.get_name_from_bytes_log2(old_alloc_size_log2), AllocSize.get_name_from_bytes_log2(new_alloc_size_log2) });
                 },
                 .UNREACHABLE => if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 or new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) unreachable,
             }
             const old_bucket = ALLOC_SIZE_LOG2_TO_BUCKET_IDX[old_alloc_size_log2];
             const new_bucket = ALLOC_SIZE_LOG2_TO_BUCKET_IDX[new_alloc_size_log2];
-            return old_bucket == new_bucket;
+            if (TRACK_STATS) {
+                if (old_bucket < new_bucket) self.stats.number_of_attempted_resizes_to_larger_buckets_by_bucket[old_bucket] += 1;
+                if (old_bucket == new_bucket and new_len > self.stats.largest_allocation_request_by_bucket[old_bucket]) self.stats.largest_allocation_request_by_bucket[old_bucket] = new_len;
+                if (old_bucket >= new_bucket and new_len < self.stats.smallest_allocation_request_by_bucket[old_bucket]) self.stats.smallest_allocation_request_by_bucket[old_bucket] = new_len;
+            }
+            return old_bucket >= new_bucket;
         }
 
         fn remap(self_opaque: *anyopaque, memory: []u8, alignment: mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
             _ = ret_addr;
-            _ = self_opaque;
-            const old_alloc_size_log2 = get_size_log2(memory.len, alignment);
-            const new_alloc_size_log2 = get_size_log2(new_len, alignment);
+            const self: *QuickAlloc = @ptrCast(@alignCast(self_opaque));
+            const old_alloc_size_log2 = get_bytes_log2(memory.len, alignment);
+            const new_alloc_size_log2 = get_bytes_log2(new_len, alignment);
             switch (LARGE_ALLOC_BEHAVIOR) {
                 .USE_PAGE_ALLOC, .USE_PAGE_ALLOC_AND_LOG => if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 or new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
                     @branchHint(LARGE_ALLOC_HINT);
+                    if (TRACK_STATS) {
+                        if (old_alloc_size_log2 <= LARGEST_BLOCK_SIZE_LOG2 and new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
+                            const old_bucket = ALLOC_SIZE_LOG2_TO_BUCKET_IDX[old_alloc_size_log2];
+                            self.stats.number_of_attempted_resizes_to_larger_buckets_by_bucket[old_bucket] += 1;
+                        } else if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 and new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
+                            if (new_len > memory.len) {
+                                const delta = new_len - memory.len;
+                                if (delta > self.stats.largest_attempted_page_allocator_fallback_resize_delta_grow) self.stats.largest_attempted_page_allocator_fallback_resize_delta_grow = delta;
+                            }
+                            if (new_len < memory.len) {
+                                const delta = memory.len - new_len;
+                                if (delta > self.stats.largest_attempted_page_allocator_fallback_resize_delta_shrink) self.stats.largest_attempted_page_allocator_fallback_resize_delta_shrink = delta;
+                            }
+                            if (new_len < self.stats.smallest_page_allocator_fallback_request_ever) self.stats.smallest_page_allocator_fallback_request_ever = new_len;
+                            if (new_len > self.stats.largest_page_allocator_fallback_request_ever) self.stats.largest_page_allocator_fallback_request_ever = new_len;
+                            const resize_result = PageAllocator.realloc(memory, new_len, true);
+                            if (resize_result != null) {
+                                if (new_len > memory.len) self.stats.current_total_memory_allocated += (new_len - memory.len);
+                                if (new_len < memory.len) self.stats.current_total_memory_allocated -= (memory.len - new_len);
+                            }
+                            return resize_result;
+                        }
+                        return null;
+                    }
                     if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 and new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) return PageAllocator.realloc(memory, new_len, true);
                     return null;
                 },
                 .PANIC => if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 or new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
                     @branchHint(.cold);
-                    std.debug.panic(MSG_LARGE_RESIZE, .{ @tagName(@as(AllocSize, @enumFromInt(old_alloc_size_log2))), @tagName(@as(AllocSize, @enumFromInt(new_alloc_size_log2))) });
+                    std.debug.panic(MSG_LARGE_RESIZE, .{ AllocSize.get_name_from_bytes_log2(old_alloc_size_log2), AllocSize.get_name_from_bytes_log2(new_alloc_size_log2) });
                 },
                 .UNREACHABLE => if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 or new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) unreachable,
             }
             const old_bucket = ALLOC_SIZE_LOG2_TO_BUCKET_IDX[old_alloc_size_log2];
             const new_bucket = ALLOC_SIZE_LOG2_TO_BUCKET_IDX[new_alloc_size_log2];
-            if (old_bucket == new_bucket) return memory.ptr;
+            if (TRACK_STATS) {
+                if (old_bucket < new_bucket) self.stats.number_of_attempted_resizes_to_larger_buckets_by_bucket[old_bucket] += 1;
+                if (old_bucket == new_bucket and new_len > self.stats.largest_allocation_request_by_bucket[old_bucket]) self.stats.largest_allocation_request_by_bucket[old_bucket] = new_len;
+                if (old_bucket >= new_bucket and new_len < self.stats.smallest_allocation_request_by_bucket[old_bucket]) self.stats.smallest_allocation_request_by_bucket[old_bucket] = new_len;
+            }
+            if (old_bucket >= new_bucket) return memory.ptr;
             return null;
         }
 
         fn free(self_opaque: *anyopaque, memory: []u8, alignment: mem.Alignment, ret_addr: usize) void {
             _ = ret_addr;
             const self: *QuickAlloc = @ptrCast(@alignCast(self_opaque));
-            const alloc_size_log2 = get_size_log2(memory.len, alignment);
+            const alloc_size_log2 = get_bytes_log2(memory.len, alignment);
             switch (LARGE_ALLOC_BEHAVIOR) {
                 .USE_PAGE_ALLOC, .USE_PAGE_ALLOC_AND_LOG => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
                     @branchHint(LARGE_ALLOC_HINT);
+                    if (TRACK_STATS) {
+                        self.stats.current_number_of_page_allocator_fallback_allocations -= 1;
+                        self.stats.current_total_bytes_allocated_from_page_allocator_fallback -= memory.len;
+                        self.stats.current_total_memory_allocated -= memory.len;
+                    }
                     return PageAllocator.unmap(@alignCast(memory));
                 },
                 .PANIC => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
                     @branchHint(.cold);
-                    std.debug.panic(MSG_LARGE_FREE, .{@tagName(@as(AllocSize, @enumFromInt(alloc_size_log2)))});
+                    std.debug.panic(MSG_LARGE_FREE, .{AllocSize.get_name_from_bytes_log2(alloc_size_log2)});
                 },
                 .UNREACHABLE => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) unreachable,
             }
@@ -420,6 +609,9 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
             curr_first_free_ptr.* = prev_first_free_address;
             self.first_recycled_block_by_bucket[bucket_idx] = curr_first_free_addr;
             self.recycled_block_count_by_bucket[bucket_idx] += 1;
+            if (TRACK_STATS) {
+                self.stats.current_blocks_used_by_bucket[bucket_idx] -= 1;
+            }
         }
 
         // pub fn organize_free_blocks(minimum_allocations_to_keep: usize, maximum_allocations_to_keep: usize) void {}
@@ -427,46 +619,40 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
         pub fn log_usage_statistics(self: *const QuickAlloc) void {
             @branchHint(STAT_LOG_HINT);
             var i: usize = 0;
-            std.log.info("\n[QuickAlloc] Free Block Report\nSIZE GROUP | FREE BLOCKS | FREE SLABS\n----------+-------------+-----------", .{});
+            std.log.info("\n[QuickAlloc] Usage Statistics\n======== FREE MEMORY STATS =========\nSIZE GROUP    | FREE BLOCKS | FREE SLABS\n----------+-------------+-----------\n", .{});
             while (i < BUCKET_COUNT) : (i += 1) {
-                var block_count: usize = 0;
-                var first_free_addr: usize = self.first_recycled_block_by_bucket[i];
-                while (first_free_addr != 0) {
-                    block_count += 1;
-                    const first_free_ptr: *usize = @ptrFromInt(first_free_addr);
-                    first_free_addr = first_free_ptr.*;
-                }
+                const block_count: usize = self.recycled_block_count_by_bucket[i] + self.brand_new_block_count_by_bucket[i];
                 const slab_count = block_count / BLOCKS_PER_SLAB[i];
-                std.log.info("{s: >10} | {d: >11} | {d: >10}\n", .{ @tagName(@as(AllocSize, @enumFromInt(BLOCK_BYTES_LOG2[i]))), block_count, slab_count });
+                std.log.info("{s: >13} | {d: >11} | {d: >10}\n", .{ AllocSize.get_name_from_bytes_log2(BLOCK_BYTES_LOG2[i]), block_count, slab_count });
+            }
+            if (TRACK_STATS) {
+                // largest_number_of_page_allocator_fallback_allocations: usize = 0,
+                // current_number_of_page_allocator_fallback_allocations: usize = 0,
+                // largest_attempted_page_allocator_fallback_resize_grow: usize = 0,
+                std.log.info("\n======== USED MEMORY STATS =========\n", .{});
+                std.log.info("Current total memory allocated: {d}\nLargest total memory allocated: {d}\n", .{ self.stats.current_total_memory_allocated, self.stats.largest_total_memory_allocated });
+                std.log.info("Smallest allocation ever requested: {d}\nLargest allocation ever requested: {d}\n", .{ self.stats.smallest_allocation_request_ever, self.stats.largest_allocation_request_ever });
+                std.log.info("---- Bucket Stats ----\n", .{});
+                while (i < BUCKET_COUNT) : (i += 1) {
+                    std.log.info("---- {s}\n", .{AllocSize.get_name_from_bytes_log2(BLOCK_BYTES_LOG2[i])});
+                    std.log.info("Smallest single allocation: {d}\nLargest single allocation: {d}\n", .{ self.stats.smallest_allocation_request_by_bucket[i], self.stats.largest_allocation_request_by_bucket[i] });
+                    std.log.info("Current blocks used by bucket: {d}\nMost blocks ever used by bucket: {d}\n", .{ self.stats.current_blocks_used_by_bucket[i], self.stats.most_blocks_ever_used_by_bucket[i] });
+                    std.log.info("Current slabs used by bucket: {d}\nMost slabs ever used by bucket: {d}\n", .{ self.stats.current_slabs_used_by_bucket[i], self.stats.most_slabs_ever_used_by_bucket[i] });
+                    std.log.info("Number of attempted resizes to larger buckets: {d}\n", .{self.stats.number_of_attempted_resizes_to_larger_buckets_by_bucket[i]});
+                }
+                std.log.info("---- Page Alloc\n", .{});
+                std.log.info("Smallest single allocation: {d}\nLargest single allocation: {d}\n", .{ self.stats.smallest_page_allocator_fallback_request_ever, self.stats.largest_page_allocator_fallback_request_ever });
+                std.log.info("Current total bytes allocated: {d}\nLargest total bytes allocated: {d}\n", .{ self.stats.current_total_bytes_allocated_from_page_allocator_fallback, self.stats.largest_total_bytes_allocated_from_page_allocator_fallback });
+                std.log.info("Current number of distinct allocations: {d}\nLargest number of distinct allocations: {d}\n", .{ self.stats.current_number_of_page_allocator_fallback_allocations, self.stats.largest_number_of_page_allocator_fallback_allocations });
+                std.log.info("Largest attempted resize delta (grow): {d}\nLargest attempted resize delta (shrink): {d}\n", .{ self.stats.largest_attempted_page_allocator_fallback_resize_delta_grow, self.stats.largest_attempted_page_allocator_fallback_resize_delta_shrink });
             }
         }
     };
 }
 
-inline fn next_addr_within_same_slab_or_zero(next_addr: usize, modulo: usize, comptime smallest_block_size_log2: math.Log2Int(usize), comptime largest_block_size_log2: math.Log2Int(usize)) usize {
-    const BITS_TO_FILL_LEFT = comptime @bitSizeOf(usize) - smallest_block_size_log2;
-    const BITS_TO_FILL_RIGHT = comptime largest_block_size_log2;
-    var next_addr_mask = next_addr & modulo;
-    if (BITS_TO_FILL_LEFT > 1) next_addr_mask |= next_addr_mask << 1;
-    if (BITS_TO_FILL_LEFT > 2) next_addr_mask |= next_addr_mask << 2;
-    if (BITS_TO_FILL_LEFT > 4) next_addr_mask |= next_addr_mask << 4;
-    if (BITS_TO_FILL_LEFT > 8) next_addr_mask |= next_addr_mask << 8;
-    if (BITS_TO_FILL_LEFT > 16) next_addr_mask |= next_addr_mask << 16;
-    if (BITS_TO_FILL_LEFT > 32) next_addr_mask |= next_addr_mask << 32;
-    if (BITS_TO_FILL_LEFT > 64) next_addr_mask |= next_addr_mask << 64;
-    if (BITS_TO_FILL_RIGHT > 1) next_addr_mask |= next_addr_mask >> 1;
-    if (BITS_TO_FILL_RIGHT > 2) next_addr_mask |= next_addr_mask >> 2;
-    if (BITS_TO_FILL_RIGHT > 4) next_addr_mask |= next_addr_mask >> 4;
-    if (BITS_TO_FILL_RIGHT > 8) next_addr_mask |= next_addr_mask >> 8;
-    if (BITS_TO_FILL_RIGHT > 16) next_addr_mask |= next_addr_mask >> 16;
-    if (BITS_TO_FILL_RIGHT > 32) next_addr_mask |= next_addr_mask >> 32;
-    if (BITS_TO_FILL_RIGHT > 64) next_addr_mask |= next_addr_mask >> 64;
-    return next_addr & next_addr_mask;
-}
-
-inline fn get_size_log2(len: usize, alignment: mem.Alignment) usize {
+inline fn get_bytes_log2(len: usize, alignment: mem.Alignment) math.Log2Int(usize) {
     const size_log2 = @max(@bitSizeOf(usize) - @clz(len - 1), @intFromEnum(alignment));
-    return size_log2;
+    return @intCast(size_log2);
 }
 
 inline fn bytes_log2_to_alignment(val: math.Log2Int(usize)) mem.Alignment {
