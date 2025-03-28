@@ -231,7 +231,6 @@ pub const AllocSize = enum(math.Log2Int(usize)) {
 
 pub const LargeAllocBehavior = enum {
     USE_PAGE_ALLOCATOR,
-    USE_PAGE_ALLOCATOR_AND_LOG,
     PANIC,
     UNREACHABLE,
 };
@@ -347,6 +346,7 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
         const LARGEST_BLOCK_SIZE_LOG2 = TableType.largest_block_size_log2;
         const SMALLEST_BLOCK_SIZE_LOG2 = TableType.smallest_block_size_log2;
         const LARGE_ALLOC_BEHAVIOR = options.large_allocation_behavior;
+        const PAGE_ALLOC: bool = LARGE_ALLOC_BEHAVIOR == .USE_PAGE_ALLOCATOR;
         const LARGE_ALLOC_HINT = options.hint_large_allocation.to_hint();
         const RECYCLE_HINT = options.hint_buckets_have_free_blocks_that_were_used_in_the_past;
         const BRAND_NEW_HINT = options.hint_buckets_have_free_blocks_that_have_never_been_used;
@@ -368,14 +368,14 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
             most_slabs_ever_used_by_bucket: [BUCKET_COUNT]usize = @splat(0),
             current_slabs_used_by_bucket: [BUCKET_COUNT]usize = @splat(0),
             number_of_attempted_resizes_to_larger_buckets_by_bucket: [BUCKET_COUNT]usize = @splat(0),
-            largest_page_allocator_fallback_request_ever: usize = 0,
-            smallest_page_allocator_fallback_request_ever: usize = math.maxInt(usize),
-            largest_total_bytes_allocated_from_page_allocator_fallback: usize = 0,
-            current_total_bytes_allocated_from_page_allocator_fallback: usize = 0,
-            largest_number_of_page_allocator_fallback_allocations: usize = 0,
-            current_number_of_page_allocator_fallback_allocations: usize = 0,
-            largest_attempted_page_allocator_fallback_resize_delta_grow: usize = 0,
-            largest_attempted_page_allocator_fallback_resize_delta_shrink: usize = 0,
+            largest_page_allocator_fallback_request_ever: if (PAGE_ALLOC) usize else void = if (PAGE_ALLOC) 0 else void{},
+            smallest_page_allocator_fallback_request_ever: if (PAGE_ALLOC) usize else void = if (PAGE_ALLOC) math.maxInt(usize) else void{},
+            largest_total_bytes_allocated_from_page_allocator_fallback: if (PAGE_ALLOC) usize else void = if (PAGE_ALLOC) 0 else void{},
+            current_total_bytes_allocated_from_page_allocator_fallback: if (PAGE_ALLOC) usize else void = if (PAGE_ALLOC) 0 else void{},
+            largest_number_of_page_allocator_fallback_allocations: if (PAGE_ALLOC) usize else void = if (PAGE_ALLOC) 0 else void{},
+            current_number_of_page_allocator_fallback_allocations: if (PAGE_ALLOC) usize else void = if (PAGE_ALLOC) 0 else void{},
+            largest_attempted_page_allocator_fallback_resize_delta_grow: if (PAGE_ALLOC) usize else void = if (PAGE_ALLOC) 0 else void{},
+            largest_attempted_page_allocator_fallback_resize_delta_shrink: if (PAGE_ALLOC) usize else void = if (PAGE_ALLOC) 0 else void{},
         };
 
         pub const VTABLE: Allocator.VTable = .{
@@ -398,7 +398,7 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
                 if (len > self.stats.largest_allocation_request_ever) self.stats.largest_allocation_request_ever = len;
             }
             switch (LARGE_ALLOC_BEHAVIOR) {
-                .USE_PAGE_ALLOC => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
+                LargeAllocBehavior.USE_PAGE_ALLOCATOR => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
                     @branchHint(LARGE_ALLOC_HINT);
                     if (TRACK_STATS) {
                         if (len > self.stats.largest_page_allocator_fallback_request_ever) self.stats.largest_page_allocator_fallback_request_ever = len;
@@ -412,26 +412,11 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
                     }
                     return PageAllocator.map(len, alignment);
                 },
-                .USE_PAGE_ALLOC_AND_LOG => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
-                    @branchHint(LARGE_ALLOC_HINT);
-                    std.log.info(MSG_LARGE_ALLOCATION, .{AllocSize.get_name_from_bytes_log2(alloc_size_log2)});
-                    if (TRACK_STATS) {
-                        if (len > self.stats.largest_page_allocator_fallback_request_ever) self.stats.largest_page_allocator_fallback_request_ever = len;
-                        if (len < self.stats.smallest_page_allocator_fallback_request_ever) self.stats.smallest_page_allocator_fallback_request_ever = len;
-                        self.stats.current_number_of_page_allocator_fallback_allocations += 1;
-                        if (self.stats.current_number_of_page_allocator_fallback_allocations > self.stats.largest_number_of_page_allocator_fallback_allocations) self.stats.largest_number_of_page_allocator_fallback_allocations = self.stats.current_number_of_page_allocator_fallback_allocations;
-                        self.stats.current_total_bytes_allocated_from_page_allocator_fallback += len;
-                        if (self.stats.current_total_bytes_allocated_from_page_allocator_fallback > self.stats.largest_total_bytes_allocated_from_page_allocator_fallback) self.stats.largest_total_bytes_allocated_from_page_allocator_fallback = self.stats.current_total_bytes_allocated_from_page_allocator_fallback;
-                        self.stats.current_total_memory_allocated += len;
-                        if (self.stats.current_total_memory_allocated > self.stats.largest_total_memory_allocated) self.stats.largest_total_memory_allocated = self.stats.current_total_memory_allocated;
-                    }
-                    return PageAllocator.map(len, alignment);
-                },
-                .PANIC => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
+                LargeAllocBehavior.PANIC => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
                     @branchHint(.cold);
                     std.debug.panic(MSG_LARGE_ALLOCATION, .{AllocSize.get_name_from_bytes_log2(alloc_size_log2)});
                 },
-                .UNREACHABLE => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) unreachable,
+                LargeAllocBehavior.UNREACHABLE => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) unreachable,
             }
             const bucket_idx = ALLOC_SIZE_LOG2_TO_BUCKET_IDX[alloc_size_log2];
             if (self.recycled_block_count_by_bucket[bucket_idx] != 0) {
@@ -485,7 +470,7 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
             const old_alloc_size_log2 = get_bytes_log2(memory.len, alignment);
             const new_alloc_size_log2 = get_bytes_log2(new_len, alignment);
             switch (LARGE_ALLOC_BEHAVIOR) {
-                .USE_PAGE_ALLOC, .USE_PAGE_ALLOC_AND_LOG => if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 or new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
+                LargeAllocBehavior.USE_PAGE_ALLOCATOR => if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 or new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
                     @branchHint(LARGE_ALLOC_HINT);
                     if (TRACK_STATS) {
                         if (old_alloc_size_log2 <= LARGEST_BLOCK_SIZE_LOG2 and new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
@@ -514,11 +499,11 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
                     if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 and new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) return PageAllocator.realloc(memory, new_len, false) != null;
                     return false;
                 },
-                .PANIC => if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 or new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
+                LargeAllocBehavior.PANIC => if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 or new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
                     @branchHint(.cold);
                     std.debug.panic(MSG_LARGE_RESIZE, .{ AllocSize.get_name_from_bytes_log2(old_alloc_size_log2), AllocSize.get_name_from_bytes_log2(new_alloc_size_log2) });
                 },
-                .UNREACHABLE => if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 or new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) unreachable,
+                LargeAllocBehavior.UNREACHABLE => if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 or new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) unreachable,
             }
             const old_bucket = ALLOC_SIZE_LOG2_TO_BUCKET_IDX[old_alloc_size_log2];
             const new_bucket = ALLOC_SIZE_LOG2_TO_BUCKET_IDX[new_alloc_size_log2];
@@ -536,7 +521,7 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
             const old_alloc_size_log2 = get_bytes_log2(memory.len, alignment);
             const new_alloc_size_log2 = get_bytes_log2(new_len, alignment);
             switch (LARGE_ALLOC_BEHAVIOR) {
-                .USE_PAGE_ALLOC, .USE_PAGE_ALLOC_AND_LOG => if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 or new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
+                LargeAllocBehavior.USE_PAGE_ALLOCATOR => if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 or new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
                     @branchHint(LARGE_ALLOC_HINT);
                     if (TRACK_STATS) {
                         if (old_alloc_size_log2 <= LARGEST_BLOCK_SIZE_LOG2 and new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
@@ -565,11 +550,11 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
                     if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 and new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) return PageAllocator.realloc(memory, new_len, true);
                     return null;
                 },
-                .PANIC => if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 or new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
+                LargeAllocBehavior.PANIC => if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 or new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
                     @branchHint(.cold);
                     std.debug.panic(MSG_LARGE_RESIZE, .{ AllocSize.get_name_from_bytes_log2(old_alloc_size_log2), AllocSize.get_name_from_bytes_log2(new_alloc_size_log2) });
                 },
-                .UNREACHABLE => if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 or new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) unreachable,
+                LargeAllocBehavior.UNREACHABLE => if (old_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2 or new_alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) unreachable,
             }
             const old_bucket = ALLOC_SIZE_LOG2_TO_BUCKET_IDX[old_alloc_size_log2];
             const new_bucket = ALLOC_SIZE_LOG2_TO_BUCKET_IDX[new_alloc_size_log2];
@@ -587,7 +572,7 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
             const self: *QuickAlloc = @ptrCast(@alignCast(self_opaque));
             const alloc_size_log2 = get_bytes_log2(memory.len, alignment);
             switch (LARGE_ALLOC_BEHAVIOR) {
-                .USE_PAGE_ALLOC, .USE_PAGE_ALLOC_AND_LOG => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
+                LargeAllocBehavior.USE_PAGE_ALLOCATOR => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
                     @branchHint(LARGE_ALLOC_HINT);
                     if (TRACK_STATS) {
                         self.stats.current_number_of_page_allocator_fallback_allocations -= 1;
@@ -596,11 +581,11 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
                     }
                     return PageAllocator.unmap(@alignCast(memory));
                 },
-                .PANIC => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
+                LargeAllocBehavior.PANIC => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) {
                     @branchHint(.cold);
                     std.debug.panic(MSG_LARGE_FREE, .{AllocSize.get_name_from_bytes_log2(alloc_size_log2)});
                 },
-                .UNREACHABLE => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) unreachable,
+                LargeAllocBehavior.UNREACHABLE => if (alloc_size_log2 > LARGEST_BLOCK_SIZE_LOG2) unreachable,
             }
             const bucket_idx = ALLOC_SIZE_LOG2_TO_BUCKET_IDX[alloc_size_log2];
             const prev_first_free_address = self.first_recycled_block_by_bucket[bucket_idx];
@@ -626,9 +611,6 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
                 std.log.info("{s: >13} | {d: >11} | {d: >10}\n", .{ AllocSize.get_name_from_bytes_log2(BLOCK_BYTES_LOG2[i]), block_count, slab_count });
             }
             if (TRACK_STATS) {
-                // largest_number_of_page_allocator_fallback_allocations: usize = 0,
-                // current_number_of_page_allocator_fallback_allocations: usize = 0,
-                // largest_attempted_page_allocator_fallback_resize_grow: usize = 0,
                 std.log.info("\n======== USED MEMORY STATS =========\n", .{});
                 std.log.info("Current total memory allocated: {d}\nLargest total memory allocated: {d}\n", .{ self.stats.current_total_memory_allocated, self.stats.largest_total_memory_allocated });
                 std.log.info("Smallest allocation ever requested: {d}\nLargest allocation ever requested: {d}\n", .{ self.stats.smallest_allocation_request_ever, self.stats.largest_allocation_request_ever });
@@ -640,11 +622,13 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
                     std.log.info("Current slabs used by bucket: {d}\nMost slabs ever used by bucket: {d}\n", .{ self.stats.current_slabs_used_by_bucket[i], self.stats.most_slabs_ever_used_by_bucket[i] });
                     std.log.info("Number of attempted resizes to larger buckets: {d}\n", .{self.stats.number_of_attempted_resizes_to_larger_buckets_by_bucket[i]});
                 }
-                std.log.info("---- Page Alloc\n", .{});
-                std.log.info("Smallest single allocation: {d}\nLargest single allocation: {d}\n", .{ self.stats.smallest_page_allocator_fallback_request_ever, self.stats.largest_page_allocator_fallback_request_ever });
-                std.log.info("Current total bytes allocated: {d}\nLargest total bytes allocated: {d}\n", .{ self.stats.current_total_bytes_allocated_from_page_allocator_fallback, self.stats.largest_total_bytes_allocated_from_page_allocator_fallback });
-                std.log.info("Current number of distinct allocations: {d}\nLargest number of distinct allocations: {d}\n", .{ self.stats.current_number_of_page_allocator_fallback_allocations, self.stats.largest_number_of_page_allocator_fallback_allocations });
-                std.log.info("Largest attempted resize delta (grow): {d}\nLargest attempted resize delta (shrink): {d}\n", .{ self.stats.largest_attempted_page_allocator_fallback_resize_delta_grow, self.stats.largest_attempted_page_allocator_fallback_resize_delta_shrink });
+                if (PAGE_ALLOC) {
+                    std.log.info("---- Page Allocator\n", .{});
+                    std.log.info("Smallest single allocation: {d}\nLargest single allocation: {d}\n", .{ self.stats.smallest_page_allocator_fallback_request_ever, self.stats.largest_page_allocator_fallback_request_ever });
+                    std.log.info("Current total bytes allocated: {d}\nLargest total bytes allocated: {d}\n", .{ self.stats.current_total_bytes_allocated_from_page_allocator_fallback, self.stats.largest_total_bytes_allocated_from_page_allocator_fallback });
+                    std.log.info("Current number of distinct allocations: {d}\nLargest number of distinct allocations: {d}\n", .{ self.stats.current_number_of_page_allocator_fallback_allocations, self.stats.largest_number_of_page_allocator_fallback_allocations });
+                    std.log.info("Largest attempted resize delta (grow): {d}\nLargest attempted resize delta (shrink): {d}\n", .{ self.stats.largest_attempted_page_allocator_fallback_resize_delta_grow, self.stats.largest_attempted_page_allocator_fallback_resize_delta_shrink });
+                }
             }
         }
     };
