@@ -254,7 +254,7 @@ fn build_table_type(comptime buckets: []const BucketDef) type {
             }
             if (slab_size == temp_slab_buf[sidx]) continue :outer;
         }
-        temp_slab_buf[temp_slab_len] = slab_size;
+        temp_slab_buf[temp_slab_len].* = slab_size;
         temp_slab_len += 1;
     }
     const slab_arr: [temp_slab_len]usize = undefined;
