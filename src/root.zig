@@ -238,7 +238,7 @@ pub const LargeAllocBehavior = enum {
 fn build_table_type(comptime buckets: []const BucketDef) type {
     // Sort slabs by size, check their validity
     var idx: usize = 0;
-    const temp_slab_buf: [buckets.len]usize = undefined;
+    var temp_slab_buf: [buckets.len]usize = undefined;
     var temp_slab_len: usize = 0;
     outer: while (idx < buckets.len) : (idx += 1) {
         const slab_size = buckets[idx].slab_size.bytes_log2();
@@ -254,7 +254,7 @@ fn build_table_type(comptime buckets: []const BucketDef) type {
             }
             if (slab_size == temp_slab_buf[sidx]) continue :outer;
         }
-        temp_slab_buf[temp_slab_len].* = slab_size;
+        temp_slab_buf[temp_slab_len] = slab_size;
         temp_slab_len += 1;
     }
     const slab_arr: [temp_slab_len]usize = undefined;
