@@ -321,7 +321,7 @@ fn build_tables(comptime TableType: type, comptime buckets: []const BucketDef) T
 }
 
 pub fn define_allocator(comptime options: QuickAllocOptions) type {
-    if (options.bucket_sizes.len == 0) @panic("must provide at least one allocation bucket");
+    if (options.buckets.len == 0) @panic("must provide at least one allocation bucket");
     const TableType = build_table_type(options.buckets);
     const tables = build_tables(TableType, options.buckets);
     return struct {
