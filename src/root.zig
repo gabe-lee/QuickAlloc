@@ -8,6 +8,8 @@ const PageAllocator = std.heap.PageAllocator;
 const List = std.ArrayList;
 const BranchHint = std.builtin.BranchHint;
 
+const Log2Usize = math.Log2Int(usize);
+
 pub const QuickAllocOptions = struct {
     /// A list of all allocation size buckets desired for this allocator. Any requested allocation will be
     /// sent to the smallest bucket that can hold it, and take exactly one single block from that bucket.
@@ -94,7 +96,7 @@ pub const BucketDef = struct {
     block_size: AllocSize,
 };
 
-pub const AllocSize = enum(math.Log2Int(usize)) {
+pub const AllocSize = enum(Log2Usize) {
     _1_B = 0,
     _2_B = 1,
     _4_B = 2,
@@ -152,7 +154,7 @@ pub const AllocSize = enum(math.Log2Int(usize)) {
         return get_name_from_bytes_log2(@intFromEnum(self));
     }
 
-    pub fn get_name_from_bytes_log2(val: math.Log2Int(usize)) []const u8 {
+    pub fn get_name_from_bytes_log2(val: Log2Usize) []const u8 {
         return switch (val) {
             0 => "1 byte",
             1 => "2 bytes",
@@ -235,7 +237,9 @@ pub const LargeAllocBehavior = enum {
     UNREACHABLE,
 };
 
-fn build_table_type(comptime buckets: []const BucketDef) type {
+pub fn define_allocator(comptime options: QuickAllocOptions) type {
+    if (options.buckets.len == 0) @panic("must provide at least one allocation bucket");
+    const buckets = options.buckets;
     // Sort slabs by size, check their validity
     var idx: usize = 0;
     var temp_slab_buf: [buckets.len]usize = undefined;
@@ -248,7 +252,7 @@ fn build_table_type(comptime buckets: []const BucketDef) type {
         while (sidx < temp_slab_len) : (sidx += 1) {
             if (slab_size < temp_slab_buf[sidx]) {
                 mem.copyBackwards(usize, temp_slab_buf[sidx + 1 .. temp_slab_len + 1], temp_slab_buf[sidx..temp_slab_len]);
-                temp_slab_buf[sidx] = slab_size;
+                temp_slab_buf[sidx].* = slab_size;
                 temp_slab_len += 1;
                 continue :outer;
             }
@@ -257,31 +261,25 @@ fn build_table_type(comptime buckets: []const BucketDef) type {
         temp_slab_buf[temp_slab_len] = slab_size;
         temp_slab_len += 1;
     }
-    const slab_arr: [temp_slab_len]usize = undefined;
+    var slab_arr: [temp_slab_len]usize = undefined;
     @memcpy(slab_arr[0..temp_slab_len], temp_slab_buf[0..temp_slab_len]);
+    const largest_block_size_log2: usize = buckets[buckets.len - 1].block_size.bytes_log2();
+    const smallest_block_size_log2: usize = buckets[0].block_size.bytes_log2();
+    const size_count: usize = buckets[buckets.len - 1].block_size.bytes_log2() + 1;
+    const slab_count: usize = temp_slab_len;
+    const slab_sizes: [slab_count]usize = slab_arr;
     // build table type
-    return struct {
-        pub const largest_block_size_log2: usize = buckets[buckets.len - 1].block_size.bytes_log2();
-        pub const smallest_block_size_log2: usize = buckets[0].block_size.bytes_log2();
-        pub const size_count: usize = buckets[buckets.len - 1].block_size.bytes_log2() + 1;
-        pub const slab_count: usize = slab_arr.len;
-        pub const slab_sizes: [slab_count]usize = slab_arr;
-        block_log2_sizes: [buckets.len]math.Log2Int(usize) = undefined,
-        block_byte_sizes: [buckets.len]usize = undefined,
-        slab_log2_sizes: [buckets.len]math.Log2Int(usize) = undefined,
-        slab_byte_sizes: [buckets.len]usize = undefined,
-        slab_modulo: [buckets.len]usize = undefined,
-        blocks_per_slab: [buckets.len]usize = undefined,
-        leftover_blocks_per_slab: [buckets.len]usize = undefined,
-        bucket_to_slab_mapping: [buckets.len]usize = undefined,
-        alloc_size_to_bucket_mapping: [size_count]usize = undefined,
-    };
-}
-
-fn build_tables(comptime TableType: type, comptime buckets: []const BucketDef) TableType {
     // check buckets and build bucket idx tables
-    var idx: usize = 0;
-    var tables = TableType{};
+    var block_log2_sizes: [buckets.len]Log2Usize = undefined;
+    var block_byte_sizes: [buckets.len]usize = undefined;
+    var slab_log2_sizes: [buckets.len]Log2Usize = undefined;
+    var slab_byte_sizes: [buckets.len]usize = undefined;
+    var slab_modulo: [buckets.len]usize = undefined;
+    var blocks_per_slab: [buckets.len]usize = undefined;
+    var leftover_blocks_per_slab: [buckets.len]usize = undefined;
+    var bucket_to_slab_mapping: [buckets.len]usize = undefined;
+    var alloc_size_to_bucket_mapping: [size_count]usize = undefined;
+    idx = 0;
     var this_block_size: usize = buckets[idx].block_size.bytes_log2();
     while (idx < buckets.len) : (idx += 1) {
         const this_block_bytes = buckets[idx].block_size.bytes();
@@ -289,41 +287,74 @@ fn build_tables(comptime TableType: type, comptime buckets: []const BucketDef) T
         const this_slab_bytes = buckets[idx].slab_size.bytes();
         if (this_block_size > this_slab_size) @panic("Cannot have a block size larger than slab_size");
         if (this_block_bytes < @sizeOf(usize)) @panic("Cannot have a block size smaller than @sizeOf(usize)");
-        if (idx < buckets.len - 1) {
-            const next_size = @intFromEnum(buckets[idx + 1]);
-            if (this_block_size >= next_size) @panic("bucket sizes MUST be in sorted order from smallest to largest, and there cannot be 2 buckets of the same size");
-            this_block_size = next_size;
-        }
         const slab_idx = calc: {
             var s: usize = 0;
-            while (s < TableType.slab_count) : (s += 1) {
-                if (this_slab_size == TableType.slab_sizes[s]) break :calc s;
+            while (s < slab_count) : (s += 1) {
+                if (this_slab_size == slab_sizes[s]) break :calc s;
             }
             unreachable;
         };
-        tables.block_log2_sizes[idx] = this_block_size;
-        tables.block_byte_sizes[idx] = this_block_bytes;
-        tables.slab_log2_sizes[idx] = this_slab_size;
-        tables.slab_byte_sizes[idx] = this_slab_bytes;
-        tables.slab_modulo[idx] = this_block_bytes - 1;
-        tables.blocks_per_slab[idx] = this_slab_bytes / this_block_bytes;
-        tables.leftover_blocks_per_slab[idx] = tables.blocks_per_slab[idx] - 1;
-        tables.bucket_to_slab_mapping[idx] = slab_idx;
+        block_log2_sizes[idx] = this_block_size;
+        block_byte_sizes[idx] = this_block_bytes;
+        slab_log2_sizes[idx] = this_slab_size;
+        slab_byte_sizes[idx] = this_slab_bytes;
+        slab_modulo[idx] = this_block_bytes - 1;
+        blocks_per_slab[idx] = this_slab_bytes / this_block_bytes;
+        leftover_blocks_per_slab[idx] = blocks_per_slab[idx] - 1;
+        bucket_to_slab_mapping[idx] = slab_idx;
+        if (idx < buckets.len - 1) {
+            const next_size = @intFromEnum(buckets[idx + 1].block_size);
+            if (this_block_size >= next_size) @panic("bucket sizes MUST be in sorted order from smallest to largest, and there cannot be 2 buckets of the same size");
+            this_block_size = next_size;
+        }
     }
     // build alloc_size to bucket_idx mapping
     idx = 0;
-    var bucket_idx: usize = 0;
-    while (idx < tables.size_count) : (idx += 1) {
-        const size = @as(usize, 1) << idx;
-        if (size > tables.block_log2_sizes[bucket_idx]) bucket_idx += 1;
-        tables.alloc_size_to_bucket_mapping[idx] = bucket_idx;
+    var this_bucket_idx: usize = 0;
+    while (idx < size_count) : (idx += 1) {
+        if (idx > block_log2_sizes[this_bucket_idx]) this_bucket_idx += 1;
+        alloc_size_to_bucket_mapping[idx] = this_bucket_idx;
     }
-}
-
-pub fn define_allocator(comptime options: QuickAllocOptions) type {
-    if (options.buckets.len == 0) @panic("must provide at least one allocation bucket");
-    const TableType = build_table_type(options.buckets);
-    const tables = build_tables(TableType, options.buckets);
+    const const_block_byte_sizes: [buckets.len]usize = comptime make: {
+        var arr: [buckets.len]usize = undefined;
+        @memcpy(&arr, &block_byte_sizes);
+        break :make arr;
+    };
+    const const_block_log2_sizes: [buckets.len]Log2Usize = comptime make: {
+        var arr: [buckets.len]Log2Usize = undefined;
+        @memcpy(&arr, &block_log2_sizes);
+        break :make arr;
+    };
+    const const_slab_byte_sizes: [buckets.len]usize = comptime make: {
+        var arr: [buckets.len]usize = undefined;
+        @memcpy(&arr, &slab_byte_sizes);
+        break :make arr;
+    };
+    const const_slab_log2_sizes: [buckets.len]Log2Usize = comptime make: {
+        var arr: [buckets.len]Log2Usize = undefined;
+        @memcpy(&arr, &slab_log2_sizes);
+        break :make arr;
+    };
+    const const_slab_modulo: [buckets.len]usize = comptime make: {
+        var arr: [buckets.len]usize = undefined;
+        @memcpy(&arr, &slab_modulo);
+        break :make arr;
+    };
+    const const_blocks_per_slab: [buckets.len]usize = comptime make: {
+        var arr: [buckets.len]usize = undefined;
+        @memcpy(&arr, &blocks_per_slab);
+        break :make arr;
+    };
+    const const_leftover_blocks_per_slab: [buckets.len]usize = comptime make: {
+        var arr: [buckets.len]usize = undefined;
+        @memcpy(&arr, &leftover_blocks_per_slab);
+        break :make arr;
+    };
+    const const_alloc_size_to_bucket_mapping: [size_count]usize = comptime make: {
+        var arr: [size_count]usize = undefined;
+        @memcpy(&arr, &alloc_size_to_bucket_mapping);
+        break :make arr;
+    };
     return struct {
         first_recycled_block_by_bucket: [BUCKET_COUNT]usize = @splat(0),
         recycled_block_count_by_bucket: [BUCKET_COUNT]usize = @splat(0),
@@ -333,24 +364,24 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
         // first_free_allocation: usize,
 
         const QuickAlloc = @This();
-        const BUCKET_COUNT = TableType.size_count;
+        const BUCKET_COUNT = buckets.len;
         const ALLOC_ERROR_BEHAVIOR = options.slab_allocation_fail_behavior;
-        const BLOCK_BYTES = tables.block_byte_sizes;
-        const BLOCK_BYTES_LOG2 = tables.block_log2_sizes;
-        const SLAB_BYTES = tables.slab_byte_sizes;
-        const SLAB_BYTES_LOG2 = tables.slab_log2_sizes;
-        const SLAB_MODULO = tables.slab_modulo;
-        const BLOCKS_PER_SLAB = tables.blocks_per_slab;
-        const LEFTOVER_BLOCKS_PER_SLAB = tables.leftover_blocks_per_slab;
-        const ALLOC_SIZE_LOG2_TO_BUCKET_IDX = tables.alloc_size_to_bucket_mapping;
-        const LARGEST_BLOCK_SIZE_LOG2 = TableType.largest_block_size_log2;
-        const SMALLEST_BLOCK_SIZE_LOG2 = TableType.smallest_block_size_log2;
+        const BLOCK_BYTES = const_block_byte_sizes;
+        const BLOCK_BYTES_LOG2 = const_block_log2_sizes;
+        const SLAB_BYTES = const_slab_byte_sizes;
+        const SLAB_BYTES_LOG2 = const_slab_log2_sizes;
+        const SLAB_MODULO = const_slab_modulo;
+        const BLOCKS_PER_SLAB = const_blocks_per_slab;
+        const LEFTOVER_BLOCKS_PER_SLAB = const_leftover_blocks_per_slab;
+        const ALLOC_SIZE_LOG2_TO_BUCKET_IDX = const_alloc_size_to_bucket_mapping;
+        const LARGEST_BLOCK_SIZE_LOG2 = largest_block_size_log2;
+        const SMALLEST_BLOCK_SIZE_LOG2 = smallest_block_size_log2;
         const LARGE_ALLOC_BEHAVIOR = options.large_allocation_behavior;
         const PAGE_ALLOC: bool = LARGE_ALLOC_BEHAVIOR == .USE_PAGE_ALLOCATOR;
         const LARGE_ALLOC_HINT = options.hint_large_allocation.to_hint();
-        const RECYCLE_HINT = options.hint_buckets_have_free_blocks_that_were_used_in_the_past;
-        const BRAND_NEW_HINT = options.hint_buckets_have_free_blocks_that_have_never_been_used;
-        const STAT_LOG_HINT = options.hint_log_usage_statistics;
+        const RECYCLE_HINT = options.hint_buckets_have_free_blocks_that_were_used_in_the_past.to_hint();
+        const BRAND_NEW_HINT = options.hint_buckets_have_free_blocks_that_have_never_been_used.to_hint();
+        const STAT_LOG_HINT = options.hint_log_usage_statistics.to_hint();
         const TRACK_STATS = options.track_allocation_statistics;
         const MSG_LARGE_ALLOCATION = "Large allocation: largest bucket size is " ++ @tagName(@as(AllocSize, @enumFromInt(LARGEST_BLOCK_SIZE_LOG2))) ++ ", but the requested allocation would require a bucket size of {s}";
         const MSG_LARGE_RESIZE = "Large resize/remap: largest bucket size is " ++ @tagName(@as(AllocSize, @enumFromInt(LARGEST_BLOCK_SIZE_LOG2))) ++ ", but either the old memory allocation ({s}) or the new memory allocation ({s}) would exceed this limit";
@@ -601,44 +632,100 @@ pub fn define_allocator(comptime options: QuickAllocOptions) type {
 
         // pub fn organize_free_blocks(minimum_allocations_to_keep: usize, maximum_allocations_to_keep: usize) void {}
 
-        pub fn log_usage_statistics(self: *const QuickAlloc) void {
+        pub fn log_usage_statistics(self: *const QuickAlloc, log_buffer: *std.ArrayList(u8), comptime log_name: []const u8) void {
             @branchHint(STAT_LOG_HINT);
+            log_buffer.clearRetainingCapacity();
+            var log_writer = log_buffer.writer();
             var i: usize = 0;
-            std.log.info("\n[QuickAlloc] Usage Statistics\n======== FREE MEMORY STATS =========\nSIZE GROUP    | FREE BLOCKS | FREE SLABS\n----------+-------------+-----------\n", .{});
+            log_writer.print("\n[QuickAlloc] Usage Statistics ({s})\n======== FREE MEMORY STATS =========\n   SIZE GROUP | FREE SLABS | FREE BLOCKS | FREE BYTES\n--------------+------------+-------------+--------------------------\n", .{log_name}) catch @panic(FAILED_TO_LOG ++ log_name);
             while (i < BUCKET_COUNT) : (i += 1) {
+                const block_bytes_log_2: Log2Usize = BLOCK_BYTES_LOG2[i];
+                const block_bytes: usize = BLOCK_BYTES[i];
                 const block_count: usize = self.recycled_block_count_by_bucket[i] + self.brand_new_block_count_by_bucket[i];
-                const slab_count = block_count / BLOCKS_PER_SLAB[i];
-                std.log.info("{s: >13} | {d: >11} | {d: >10}\n", .{ AllocSize.get_name_from_bytes_log2(BLOCK_BYTES_LOG2[i]), block_count, slab_count });
+                const bucket_slab_count = block_count / BLOCKS_PER_SLAB[i];
+                log_writer.print("{s: >13} | {d: >10} | {d: >11} | {d: >19} bytes\n", .{ AllocSize.get_name_from_bytes_log2(block_bytes_log_2), bucket_slab_count, block_count, block_count * block_bytes }) catch @panic(FAILED_TO_LOG ++ log_name);
             }
             if (TRACK_STATS) {
-                std.log.info("\n======== USED MEMORY STATS =========\n", .{});
-                std.log.info("Current total memory allocated: {d}\nLargest total memory allocated: {d}\n", .{ self.stats.current_total_memory_allocated, self.stats.largest_total_memory_allocated });
-                std.log.info("Smallest allocation ever requested: {d}\nLargest allocation ever requested: {d}\n", .{ self.stats.smallest_allocation_request_ever, self.stats.largest_allocation_request_ever });
-                std.log.info("---- Bucket Stats ----\n", .{});
+                log_writer.print("======== USED MEMORY STATS =========\n", .{}) catch @panic("failed to allocate memory for logging: " ++ log_name);
+                log_writer.print("Current total memory allocated: {d} bytes\nLargest total memory allocated: {d} bytes\n", .{ self.stats.current_total_memory_allocated, self.stats.largest_total_memory_allocated }) catch @panic(FAILED_TO_LOG ++ log_name);
+                log_writer.print("Smallest allocation ever requested: {d} bytes\nLargest allocation ever requested: {d} bytes\n", .{ if (self.stats.smallest_allocation_request_ever == math.maxInt(usize)) 0 else self.stats.smallest_allocation_request_ever, self.stats.largest_allocation_request_ever }) catch @panic(FAILED_TO_LOG ++ log_name);
+                log_writer.print("---- BUCKET STATS ----\n", .{}) catch @panic(FAILED_TO_LOG ++ log_name);
+                i = 0;
                 while (i < BUCKET_COUNT) : (i += 1) {
-                    std.log.info("---- {s}\n", .{AllocSize.get_name_from_bytes_log2(BLOCK_BYTES_LOG2[i])});
-                    std.log.info("Smallest single allocation: {d}\nLargest single allocation: {d}\n", .{ self.stats.smallest_allocation_request_by_bucket[i], self.stats.largest_allocation_request_by_bucket[i] });
-                    std.log.info("Current blocks used by bucket: {d}\nMost blocks ever used by bucket: {d}\n", .{ self.stats.current_blocks_used_by_bucket[i], self.stats.most_blocks_ever_used_by_bucket[i] });
-                    std.log.info("Current slabs used by bucket: {d}\nMost slabs ever used by bucket: {d}\n", .{ self.stats.current_slabs_used_by_bucket[i], self.stats.most_slabs_ever_used_by_bucket[i] });
-                    std.log.info("Number of attempted resizes to larger buckets: {d}\n", .{self.stats.number_of_attempted_resizes_to_larger_buckets_by_bucket[i]});
+                    const local_i = i;
+                    const block_bytes_log_2: Log2Usize = BLOCK_BYTES_LOG2[local_i];
+                    log_writer.print("  [{s}]\n", .{AllocSize.get_name_from_bytes_log2(block_bytes_log_2)}) catch @panic(FAILED_TO_LOG ++ log_name);
+                    log_writer.print("     Smallest single allocation: {d} bytes\n     Largest single allocation: {d} bytes\n", .{ if (self.stats.smallest_allocation_request_by_bucket[i] == math.maxInt(usize)) 0 else self.stats.smallest_allocation_request_by_bucket[i], self.stats.largest_allocation_request_by_bucket[i] }) catch @panic(FAILED_TO_LOG ++ log_name);
+                    log_writer.print("     Current blocks used by bucket: {d}\n     Most blocks ever used by bucket: {d}\n", .{ self.stats.current_blocks_used_by_bucket[i], self.stats.most_blocks_ever_used_by_bucket[i] }) catch @panic(FAILED_TO_LOG ++ log_name);
+                    log_writer.print("     Current slabs used by bucket: {d}\n     Most slabs ever used by bucket: {d}\n", .{ self.stats.current_slabs_used_by_bucket[i], self.stats.most_slabs_ever_used_by_bucket[i] }) catch @panic(FAILED_TO_LOG ++ log_name);
+                    log_writer.print("     Number of attempted resizes to larger buckets: {d}\n", .{self.stats.number_of_attempted_resizes_to_larger_buckets_by_bucket[i]}) catch @panic(FAILED_TO_LOG ++ log_name);
                 }
                 if (PAGE_ALLOC) {
-                    std.log.info("---- Page Allocator\n", .{});
-                    std.log.info("Smallest single allocation: {d}\nLargest single allocation: {d}\n", .{ self.stats.smallest_page_allocator_fallback_request_ever, self.stats.largest_page_allocator_fallback_request_ever });
-                    std.log.info("Current total bytes allocated: {d}\nLargest total bytes allocated: {d}\n", .{ self.stats.current_total_bytes_allocated_from_page_allocator_fallback, self.stats.largest_total_bytes_allocated_from_page_allocator_fallback });
-                    std.log.info("Current number of distinct allocations: {d}\nLargest number of distinct allocations: {d}\n", .{ self.stats.current_number_of_page_allocator_fallback_allocations, self.stats.largest_number_of_page_allocator_fallback_allocations });
-                    std.log.info("Largest attempted resize delta (grow): {d}\nLargest attempted resize delta (shrink): {d}\n", .{ self.stats.largest_attempted_page_allocator_fallback_resize_delta_grow, self.stats.largest_attempted_page_allocator_fallback_resize_delta_shrink });
+                    log_writer.print("  [Page Allocator]\n", .{}) catch @panic(FAILED_TO_LOG ++ log_name);
+                    log_writer.print("     Smallest single allocation: {d} bytes\n     Largest single allocation: {d} bytes\n", .{ if (self.stats.smallest_page_allocator_fallback_request_ever == math.maxInt(usize)) 0 else self.stats.smallest_page_allocator_fallback_request_ever, self.stats.largest_page_allocator_fallback_request_ever }) catch @panic(FAILED_TO_LOG ++ log_name);
+                    log_writer.print("     Current total bytes allocated: {d} bytes\n     Largest total bytes allocated: {d} bytes\n", .{ self.stats.current_total_bytes_allocated_from_page_allocator_fallback, self.stats.largest_total_bytes_allocated_from_page_allocator_fallback }) catch @panic(FAILED_TO_LOG ++ log_name);
+                    log_writer.print("     Current number of distinct allocations: {d}\n     Largest number of distinct allocations: {d}\n", .{ self.stats.current_number_of_page_allocator_fallback_allocations, self.stats.largest_number_of_page_allocator_fallback_allocations }) catch @panic(FAILED_TO_LOG ++ log_name);
+                    log_writer.print("     Largest attempted resize delta (grow): {d} bytes\n     Largest attempted resize delta (shrink): {d} bytes\n", .{ self.stats.largest_attempted_page_allocator_fallback_resize_delta_grow, self.stats.largest_attempted_page_allocator_fallback_resize_delta_shrink }) catch @panic(FAILED_TO_LOG ++ log_name);
                 }
             }
+            std.log.info("{s}", .{log_buffer.items[0..log_buffer.items.len]});
         }
     };
 }
 
-inline fn get_bytes_log2(len: usize, alignment: mem.Alignment) math.Log2Int(usize) {
+const FAILED_TO_LOG = "failed to allocate memory for logging: ";
+
+inline fn get_bytes_log2(len: usize, alignment: mem.Alignment) Log2Usize {
     const size_log2 = @max(@bitSizeOf(usize) - @clz(len - 1), @intFromEnum(alignment));
     return @intCast(size_log2);
 }
 
-inline fn bytes_log2_to_alignment(val: math.Log2Int(usize)) mem.Alignment {
+inline fn bytes_log2_to_alignment(val: Log2Usize) mem.Alignment {
     return @enumFromInt(val);
+}
+
+test "Does it basically work?" {
+    const t = std.testing;
+    t.log_level = .err;
+    const ListU8 = std.ArrayList(u8);
+    var log_buffer = ListU8.init(std.heap.page_allocator);
+    const ALLOC_OPTIONS = QuickAllocOptions{
+        .buckets = &[_]BucketDef{
+            BucketDef{
+                .block_size = ._128_B,
+                .slab_size = ._4_KB,
+            },
+            BucketDef{
+                .block_size = ._1_KB,
+                .slab_size = ._16_KB,
+            },
+        },
+        .track_allocation_statistics = true,
+        .hint_log_usage_statistics = .VERY_LIKELY,
+        .large_allocation_behavior = .USE_PAGE_ALLOCATOR,
+        .hint_large_allocation = .VERY_LIKELY,
+    };
+    const ALLOC = define_allocator(ALLOC_OPTIONS);
+    var quick_alloc = ALLOC{};
+    const allocator = quick_alloc.allocator();
+    var text_list = ListU8.init(allocator);
+    try text_list.append('H');
+    try text_list.append('e');
+    try text_list.append('l');
+    try text_list.append('l');
+    try text_list.append('o');
+    try text_list.append(' ');
+    quick_alloc.log_usage_statistics(&log_buffer, "After append 'Hello ' = 6 total bytes of ListU8");
+    try text_list.appendSlice("World!");
+    quick_alloc.log_usage_statistics(&log_buffer, "After append 'World!' = 12 total bytes of ListU8");
+    try t.expectEqualStrings("Hello World!", text_list.items[0..text_list.items.len]);
+    try text_list.ensureTotalCapacity(129);
+    try t.expectEqualStrings("Hello World!", text_list.items[0..text_list.items.len]);
+    quick_alloc.log_usage_statistics(&log_buffer, "After ensureTotalCapacity(129)");
+    text_list.clearAndFree();
+    quick_alloc.log_usage_statistics(&log_buffer, "After first clear and free");
+    try text_list.ensureTotalCapacity(1025);
+    quick_alloc.log_usage_statistics(&log_buffer, "After ensureTotalCapacity(1025)");
+    text_list.clearAndFree();
+    quick_alloc.log_usage_statistics(&log_buffer, "After second clear and free");
 }
